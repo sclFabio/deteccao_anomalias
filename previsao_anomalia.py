@@ -38,7 +38,7 @@ engine = create_engine(
 # CRIAR TABELA NO BANCO CASO NÃO EXISTA (FAZER DIRETO NO MSSQL):
 
 """
-CREATE TABLE "ETA001_FTS001"
+CREATE TABLE "serie_temporal_ETA001"
 (
     "E3TimeStamp" datetime2,
     valor_ft double precision,
@@ -107,7 +107,9 @@ def preparar_dados(data, coluna_valor, data_limite):
 
     # Resample e interpolação
     data = data.resample('30min').mean().interpolate()
-    data = data.loc[data.index < pd.to_datetime(data_limite)]
+
+    data = data.loc[data.index <= pd.to_datetime(data_limite)]
+
     data['Anomalia'] = 0
     data['Anomalia_final'] = 0
 
@@ -121,7 +123,7 @@ def preparar_dados(data, coluna_valor, data_limite):
         'weekday': data.index.weekday,
         'is_weekend': (data.index.weekday >= 5).astype(int)
     }, index=data.index)
-    #print(data.describe())
+    
     return data, profile, exog
 
 def forecast(data, exog, coluna_valor, steps):
@@ -139,11 +141,13 @@ def forecast(data, exog, coluna_valor, steps):
             random_state=123,
             verbose=-1
         ),
-        lags=24,
+        #lags=24,
+        lags=168,
         steps=steps,
         window_features=RollingFeatures(
             stats=['mean', 'std', 'max', 'min'],
-            window_sizes=[6, 12, 24, 48]
+            #window_sizes=[6, 12, 24, 48]
+            window_sizes=[24, 48, 72, 168]
         )
     )
     forecaster.fit(y=data_train[coluna_valor], exog=exog_train)
@@ -153,11 +157,11 @@ def forecast(data, exog, coluna_valor, steps):
     mae = mean_absolute_error(data_test[coluna_valor], preds)
     rmse = mean_squared_error(data_test[coluna_valor], preds)
 
-    
-
+    print(f"MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+    #print(preds)
     return preds, mae, rmse
 
-def detectar_anomalias(data, coluna_valor, usar_previsao=False):
+def detectar_anomalias(data, coluna_valor, data_ref, data_limite, usar_previsao=False):
     # Configura LOF
     lof = LocalOutlierFactor(n_neighbors=5, contamination=0.05)
     
@@ -197,21 +201,17 @@ def detectar_anomalias(data, coluna_valor, usar_previsao=False):
             fim = ts + timedelta(hours=24)
             data.loc[(data.index >= ts) & (data.index <= fim), 'Anomalia_final'] = 1
     #print(data.info)        
-    inicio = (data_ref - timedelta(days=1)).normalize()  # 00:00 do dia anterior
-    fim = data_ref.normalize()  # 00:00 do dia de referência
-    anomalia = data[(data.index >= inicio) & (data.index < fim)].copy()
+    #inicio = (data_ref - timedelta(days=1)).normalize()  # 00:00 do dia anterior
+    #fim = data_ref.normalize()  # 00:00 do dia de referência
+    #anomalia = data[(data.index >= inicio) & (data.index < fim)].copy()
     
-    anomalia = anomalia[anomalia["Anomalia"] == 1] 
-    
+    data_intervalo = data[(data.index >= data_ref) & (data.index < data_limite)].copy()
+    print(data.tail(20))
+    # Se houver anomalias no período
+    anomalia = data_intervalo[data_intervalo["Anomalia_final"] == 1]
     if anomalia.empty:
         return None, data
-    anomalia = anomalia.iloc[0]
-    print(anomalia)
-    print(data.tail(48))
-    
-
-    return anomalia, data
-
+    return anomalia.iloc[0], data
 
 def buscar_referencia(estacao):
     """Busca a última anomalia de referência ativa no banco (MSSQL)"""
@@ -252,10 +252,10 @@ def atualizar_anomalia(data, coluna_valor, estacao, data_limite):
     - Uma vez encerrada, não volta a ligar
     - Atualiza anomalia_ativa no banco se encerrada
     """
-    data_limite = pd.to_datetime(data_limite)
-    inicio = (data_limite - timedelta(days=1)).normalize()
-    fim = data_limite.normalize()
-    data = data[(data.index >= inicio) & (data.index < fim)].copy()
+
+    
+    print(f'Data que deve estar sendo usada {data_ref} até {data_limite}')
+    data = data[(data.index >= data_ref) & (data.index < data_limite)].copy()
 
     ref = buscar_referencia(estacao)
     print(f"Referência encontrada: {ref}")
@@ -305,6 +305,80 @@ def atualizar_anomalia(data, coluna_valor, estacao, data_limite):
     data['Anomalia_final'] = estados
     return data
 
+
+def desativar_anomalias_expiradas(estacao, coluna_valor, data_limite):
+    """
+    Verifica todas as anomalias ativas no banco para a estação.
+    Para cada uma, carrega os dados desde o início da anomalia até data_limite.
+    Se todos os valores nesse período estiverem abaixo de ref_val → desativa.
+    """
+    conn = pyodbc.connect(
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER=172.16.101.70;DATABASE=DB_AlarmeAnomalia;"
+        f"UID=sa;PWD=SMS@2104-056",
+        timeout=10
+    )
+    cursor = conn.cursor()
+
+    # Busca TODAS as anomalias ativas (não só a mais recente)
+    query_ativas = """
+        SELECT id, data_evento, valor
+        FROM dbo.anomalias_referencia
+        WHERE estacao = ? AND anomalia_ativa = 1
+    """
+    cursor.execute(query_ativas, (estacao,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        conn.close()
+        return
+
+    # Carregar dados históricos da estação (do banco de séries)
+    data_hist = conectar_sql(
+        tabela=estacao,
+        colunas=["E3TimeStamp", coluna_valor],
+        servidor='172.16.101.70',
+        database='DBArea',
+        usuario='sa',
+        senha='SMS@2104-056',
+        comando='SELECT'
+    )
+    if data_hist.empty:
+        conn.close()
+        return
+
+    data_hist['E3TimeStamp'] = pd.to_datetime(data_hist['E3TimeStamp'], errors='coerce')
+    data_hist = data_hist.dropna(subset=['E3TimeStamp']).set_index('E3TimeStamp').sort_index()
+    data_hist = data_hist[[coluna_valor]]
+
+    data_limite_dt = pd.to_datetime(data_limite)
+
+    for row in rows:
+        ref_id = row[0]
+        ref_ts = pd.to_datetime(row[1])
+        ref_valor = float(row[2])
+        ref_val = ref_valor * 0.995
+
+        # Define janela: da anomalia até data_limite (ou até agora, se necessário)
+        segmento = data_hist[
+            (data_hist.index >= ref_ts) &
+            (data_hist.index <= data_limite_dt)
+        ]
+
+        # Se não há dados, não desativa (pode ser falha de coleta)
+        if segmento.empty:
+            continue
+
+        # Se TODOS os valores estão abaixo do limiar → desativa
+        if (segmento[coluna_valor] < ref_val).all():
+            print(f"Desativando anomalia expirada ID={ref_id} (estação {estacao})")
+            cursor.execute(
+                "UPDATE dbo.anomalias_referencia SET anomalia_ativa = 0 WHERE id = ?",
+                (ref_id,)
+            )
+            conn.commit()
+
+    conn.close()
 # --- Funções de persistência ---
 def criar_referencia_ativa(df_series, estacao):
 
@@ -384,26 +458,27 @@ def salvar_serie_temporal(conn_str, estacao, df_series):
     )
     cursor = conn.cursor()
 
-    table_name = f"serie_temporal_{estacao}"
+    table_name = f"{estacao}_FTS"
     
-
+    print(f"Salvando série temporal em {table_name}")
     query_insert = f"""
-        INSERT INTO dbo.{table_name} (E3TimeStamp, valor_ft, previsao, anomalia_detectada, anomalia_persistente)
+        INSERT INTO dbo.{table_name} (E3TimeStamp, valor_ft, anomalia_detectada, anomalia_persistente, previsao)
         VALUES (?, ?, ?, ?, ?)
     """
     print(df_series)
     rows = [
         (
             row["timestamp"].to_pydatetime(),
-            float(row["valor_ft"]),
-            #Trocar para float
-            str(row["previsao"]),
+            float(row["valor_ft"]),            
             bool(row["anomalia_detectada"]),
             bool(row["anomalia_persistente"]),
+            float(row["previsao"]),
         )
         for _, row in df_series.iterrows()
     ]
-
+    print(f"Número de registros a inserir: {len(rows)}")
+    print(query_insert)
+    print(rows)
     cursor.executemany(query_insert, rows)
     conn.commit()
     conn.close()
@@ -412,9 +487,10 @@ def salvar_serie_temporal(conn_str, estacao, df_series):
 
 
 def plotar_grafico(data, profile, coluna_valor, engine, estacao):
-    ref = buscar_referencia(engine, estacao)
+    ref = buscar_referencia(estacao)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=data.index, y=data["valor_ft"], mode='lines', name='Histórico'))
+    fig.add_trace(go.Scatter(x=data.index, y=data["previsao"], mode='lines', name='Previsão', line=dict(dash='dash')))
     fig.add_trace(go.Scatter(
         x=data.loc[data['anomalia_persistente'] == 1].index,
         y=data.loc[data['anomalia_persistente'] == 1, "valor_ft"],
@@ -436,14 +512,32 @@ def plotar_grafico(data, profile, coluna_valor, engine, estacao):
 # ============================
 
 tabelas = ['ETA001', 'EAT004', 'EAT006', 'EAT007', 'EAT017', 'EAT019', 'EAT021', 'EAT024', 'EAT025', 'EAT027', 'EAT028', 'EAT030', 'EAT032']
+#tabelas = ['ETA001', 'EAT004', 'EAT006', 'EAT007', 'EAT017', 'EAT019', 'EAT021', 'EAT024', 'EAT025', 'EAT027', 'EAT030', 'EAT032']
+#tabelas = ['EAT028']
 coluna_valor = 'FTS001'
 
+now = datetime.now()
+hora_atual = now.hour
+#Simular horarios
+#hora_atual = 7
 
-#Trocar a frequência para 12h? 6h? Horário?
-#data_ref = pd.Timestamp('2025-09-06 00:00:00')
-#data_limite = '2025-09-06'
-data_ref = pd.to_datetime(datetime.now().date())
-data_limite = pd.to_datetime(datetime.now().date())
+# Determina o intervalo de 6h que acabou de terminar
+if 0 <= hora_atual < 6:
+    data_ref = pd.to_datetime(now.date() - timedelta(days=1)) + timedelta(hours=18)
+    data_limite = pd.to_datetime(now.date())
+elif 6 <= hora_atual < 12:
+    data_ref = pd.to_datetime(now.date())
+    data_limite = pd.to_datetime(now.date()) + timedelta(hours=6)
+elif 12 <= hora_atual < 18:
+    data_ref = pd.to_datetime(now.date()) + timedelta(hours=6)
+    data_limite = pd.to_datetime(now.date()) + timedelta(hours=12)
+else:  # 18 <= hora_atual < 24
+    data_ref = pd.to_datetime(now.date()) + timedelta(hours=12)
+    data_limite = pd.to_datetime(now.date()) + timedelta(hours=18)
+
+print(f"Intervalo passado: {data_ref} → {data_limite}")
+
+#data_limite = pd.to_datetime(datetime.now().date())
 
 
 for tabela in tabelas:
@@ -461,15 +555,16 @@ for tabela in tabelas:
     senha='SMS@2104-056',
     comando='SELECT'
 )
-
+    desativar_anomalias_expiradas(estacao, coluna_valor, data_limite)
     # Preparação
     data, profile, exog = preparar_dados(data, coluna_valor=coluna_valor, data_limite=data_limite)
-    steps=48
+
+    #steps=48 # 24H
+    steps=12 
     preds, mae, rmse = forecast(data, exog, coluna_valor, steps=steps)
-
-
     # Detecta anomalias
-    anomalia ,data = detectar_anomalias(data, coluna_valor=coluna_valor)
+    anomalia, data = detectar_anomalias(data, coluna_valor=coluna_valor, data_ref=data_ref, data_limite=data_limite)
+
 
     if anomalia is not None:
         nova_ref = criar_referencia_ativa(anomalia, estacao)
@@ -477,13 +572,13 @@ for tabela in tabelas:
         salvar_anomalia_referencia('banco_samae', estacao, nova_ref)
     else:
         print("Nenhuma anomalia detectada. Nenhuma referência será salva.")
-    
 
     # Atualiza referência (persistência com base no banco)
     #data = atualizar_anomalia(data, coluna_valor=coluna_valor, engine=engine, estacao=estacao, data_limite=data_limite)
     data = atualizar_anomalia(data, coluna_valor=coluna_valor, estacao=estacao, data_limite=data_limite)
 
-
+    print("Dados após atualização de anomalias:")
+    print(data.tail(20))
     # Prepara DataFrame para salvar série temporal
     df_series = data.reset_index().rename(columns={"E3TimeStamp": "timestamp"})
     df_series["valor_ft"] = df_series[coluna_valor]
@@ -492,30 +587,28 @@ for tabela in tabelas:
     df_series["previsao"] = preds
     df_series = df_series.reset_index()
     df_series = df_series[["timestamp", "valor_ft", "previsao", "Anomalia", "Anomalia_final"]].copy()
+    #df_series = df_series[["timestamp", "valor_ft", "Anomalia", "Anomalia_final"]].copy()
     df_series = df_series.rename(columns={
         "Anomalia": "anomalia_detectada",
         "Anomalia_final": "anomalia_persistente"
     })
-    #print(data)
-    # Filtra apenas o dia anterior à data de referência
-    inicio = (data_ref - timedelta(days=1)).normalize()  # 00:00 do dia anterior
-    fim = data_ref.normalize()  # 00:00 do dia de referência
-    df_series = df_series[(df_series["timestamp"] >= inicio) & (df_series["timestamp"] < fim)].copy()
 
-    #print(df_series)
-
+    print("Série temporal sem filtro de data:")
+    print(df_series.tail(48))
+    df_series = df_series[(df_series["timestamp"] >= data_ref + timedelta(minutes=30)) & (df_series["timestamp"] <= data_limite)].copy()
+    
+    print("DataFrame final para salvar:")
+    print(df_series)
     #nova_ref = criar_referencia_ativa(df_series, estacao)
     #salvar_anomalia_referencia(engine, estacao, nova_ref)
     #salvar_serie_temporal(engine, estacao, df_series)
     salvar_serie_temporal('banco_samae', estacao, df_series)
 
-
-    #print(data)
-
-
-    """profile.to_csv(f"/root/venv/perfil_diario_{tabela}.csv")"""
-    """fig = plotar_grafico(df_series.set_index("timestamp"), profile, coluna_valor, engine, estacao)
-    fig.write_html(f"/root/venv/previsao_{tabela}_{data_limite}.html")"""
+    #table_name = f"{estacao}_FTS"
+    #print(f"Salvando série temporal em {table_name}")
+    #profile.to_csv(f"/root/venv/perfil_diario_{tabela}.csv")
+    #fig = plotar_grafico(df_series.set_index("timestamp"), profile, coluna_valor, engine, estacao)
+    #fig.write_html(f"/root/venv/previsao_{tabela}_{data_limite}.html")
 
 #Mostrar o tempo de execução do programa.
 t1 = time.time()
